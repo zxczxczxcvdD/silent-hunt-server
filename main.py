@@ -17,14 +17,30 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Хранилище в памяти
-users = {}  # {username: {"email": str, "hashed_password": str, "is_banned": bool, "created_at": datetime}}
+users = {}  # {username: {"email": str, "hashed_password": str, "is_banned": bool, "is_admin": bool, "created_at": datetime}}
 keys = {}   # {key: {"user_id": str, "is_activated": bool, "created_at": datetime}}
+
+# Инициализация начального пользователя (admin)
+initial_user = {
+    "username": "dev",
+    "email": "dev@example.com",
+    "password": "number888"
+}
+if "dev" not in users:
+    users["dev"] = {
+        "email": initial_user["email"],
+        "hashed_password": pwd_context.hash(initial_user["password"]),
+        "is_banned": False,
+        "is_admin": True,
+        "created_at": datetime.utcnow()
+    }
 
 # Pydantic модели
 class UserCreate(BaseModel):
     username: str
     email: str
     password: str
+    is_admin: bool = False  # По умолчанию обычный пользователь
 
 class KeyResponse(BaseModel):
     key: str
@@ -51,9 +67,15 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="User not found or banned")
     return user
 
+async def get_current_admin_user(token: str = Depends(oauth2_scheme)):
+    user = await get_current_user(token)
+    if not user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
 # API endpoints
 @app.post("/register")
-def register(user: UserCreate):
+def register(user: UserCreate, current_user: dict = Depends(get_current_admin_user)):
     if user.username in users:
         raise HTTPException(status_code=400, detail="Username already exists")
     for u in users.values():
@@ -64,9 +86,10 @@ def register(user: UserCreate):
         "email": user.email,
         "hashed_password": hashed_password,
         "is_banned": False,
+        "is_admin": user.is_admin,
         "created_at": datetime.utcnow()
     }
-    return {"message": "User registered successfully"}
+    return {"message": f"User {user.username} registered {'as admin' if user.is_admin else 'as regular user'} successfully"}
 
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -101,7 +124,7 @@ def activate_key(key: str, current_user: dict = Depends(get_current_user)):
     return {"message": "Key activated successfully"}
 
 @app.post("/ban-user")
-def ban_user(username: str, current_user: dict = Depends(get_current_user)):
+def ban_user(username: str, current_user: dict = Depends(get_current_admin_user)):
     user = users.get(username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
