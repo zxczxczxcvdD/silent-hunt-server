@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -17,10 +17,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Хранилище в памяти
-users = {}  # {username: {"email": str, "hashed_password": str, "is_banned": bool, "is_admin": bool, "created_at": datetime}}
-keys = {}   # {key: {"user_id": str, "is_activated": bool, "created_at": datetime}}
+users = {}
+keys = {}
 
-# Инициализация начального пользователя (admin)
+# Начальный админ
 initial_user = {
     "username": "dev",
     "email": "dev@example.com",
@@ -35,24 +35,20 @@ if "dev" not in users:
         "created_at": datetime.utcnow()
     }
 
-# Pydantic модели
 class UserCreate(BaseModel):
     username: str
     email: str
     password: str
-    is_admin: bool = False  # По умолчанию обычный пользователь
+    is_admin: bool = False
 
-class KeyResponse(BaseModel):
+class ActivateKeyRequest(BaseModel):
     key: str
-    is_activated: bool
 
-# JWT
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
@@ -65,15 +61,24 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     user = users.get(username)
     if user is None or user["is_banned"]:
         raise HTTPException(status_code=401, detail="User not found or banned")
-    return user
+    return {"username": username, **user}
 
 async def get_current_admin_user(token: str = Depends(oauth2_scheme)):
     user = await get_current_user(token)
-    if not user.get("is_admin", False):
+    if not user.get("is_admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
-# API endpoints
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = users.get(form_data.username)
+    if not user or not pwd_context.verify(form_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if user["is_banned"]:
+        raise HTTPException(status_code=403, detail="User is banned")
+    access_token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
 @app.post("/register")
 def register(user: UserCreate, current_user: dict = Depends(get_current_admin_user)):
     if user.username in users:
@@ -89,17 +94,7 @@ def register(user: UserCreate, current_user: dict = Depends(get_current_admin_us
         "is_admin": user.is_admin,
         "created_at": datetime.utcnow()
     }
-    return {"message": f"User {user.username} registered {'as admin' if user.is_admin else 'as regular user'} successfully"}
-
-@app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = users.get(form_data.username)
-    if not user or not pwd_context.verify(form_data.password, user["hashed_password"]):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    if user["is_banned"]:
-        raise HTTPException(status_code=403, detail="User is banned")
-    access_token = create_access_token(data={"sub": form_data.username})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"message": f"User {user.username} registered successfully"}
 
 @app.post("/generate-key")
 def generate_key(current_user: dict = Depends(get_current_user)):
@@ -112,7 +107,8 @@ def generate_key(current_user: dict = Depends(get_current_user)):
     return {"key": key}
 
 @app.post("/activate-key")
-def activate_key(key: str, current_user: dict = Depends(get_current_user)):
+def activate_key(request: ActivateKeyRequest, current_user: dict = Depends(get_current_user)):
+    key = request.key
     db_key = keys.get(key)
     if not db_key:
         raise HTTPException(status_code=404, detail="Key not found")
@@ -130,7 +126,3 @@ def ban_user(username: str, current_user: dict = Depends(get_current_admin_user)
         raise HTTPException(status_code=404, detail="User not found")
     user["is_banned"] = True
     return {"message": f"User {username} banned"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
